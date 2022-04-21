@@ -1,24 +1,23 @@
-// noinspection SpellCheckingInspection
+// noinspection TypeScriptUMDGlobal
 
-import {App, MarkdownView, Plugin, PluginSettingTab, Setting} from 'obsidian';
+import {App, EventRef, MarkdownView, Plugin, PluginSettingTab, Setting} from 'obsidian';
 import {exec} from "child_process";
 import {promisify} from "util";
 
 declare const CodeMirror: any
 
-
 interface VimIMSwitchSettings {
-    default_im: string;
+    defaultIM: string;
     enable: boolean;
-    obtain_im_cmd: string;
-    switch_im_cmd: string;
+    obtainIMCmd: string;
+    switchIMCmd: string;
 }
 
 const DEFAULT_SETTINGS: VimIMSwitchSettings = {
-    default_im: '',
+    defaultIM: '',
     enable: false,
-    obtain_im_cmd: '/path/to/IMCmd',
-    switch_im_cmd: '/path/to/IMCmd {im}',
+    obtainIMCmd: '/path/to/IMCmd',
+    switchIMCmd: '/path/to/IMCmd {im}',
 }
 
 const pexec = promisify(exec);
@@ -32,7 +31,7 @@ class IMStatusManager {
     // insert to normal, set insertIm to current system IM, set system IM to defaultIm
     // normal to insert, set system IM to insertIm
     setting: VimIMSwitchSettings;
-    insertIm: string;
+    insertModeLastIM: string;
 
     constructor(setting: VimIMSwitchSettings) {
         this.setting = setting;
@@ -40,23 +39,21 @@ class IMStatusManager {
     }
 
     switchIM(im: string): Promise<ExecOut> {
-        return pexec(this.setting.switch_im_cmd.replace("{im}", im));
+        return pexec(this.setting.switchIMCmd.replace("{im}", im));
     }
 
     public normalToInsert(): Promise<ExecOut> {
-        if (this.insertIm) {
-            return this.switchIM(this.insertIm);
-        } else {
-            // in case of no insertIm
-            return this.switchIM(this.setting.default_im);
+        if (this.insertModeLastIM) {
+            return this.switchIM(this.insertModeLastIM);
         }
+        return new Promise<ExecOut>(resolve => resolve({stdout: '', stderr: ''}));
     }
 
     public insertToNormal(): Promise<ExecOut> {
-        return pexec(this.setting.obtain_im_cmd).then(out => {
-            this.insertIm = out.stdout.trim();
-            if (this.setting.default_im) {
-                return this.switchIM(this.setting.default_im);
+        return pexec(this.setting.obtainIMCmd).then(out => {
+            this.insertModeLastIM = out.stdout.trim();
+            if (this.setting.defaultIM) {
+                return this.switchIM(this.setting.defaultIM);
             } else {
                 return new Promise<ExecOut>(resolve => {
                     resolve({stdout: '', stderr: 'default IM is null'});
@@ -69,11 +66,12 @@ class IMStatusManager {
 export default class VimIMSwitchPlugin extends Plugin {
     static once: boolean = true;
     settings: VimIMSwitchSettings;
-    private editors: CodeMirror.Editor[] = [];
+    private editors: Set<CodeMirror.Editor> = new Set<CodeMirror.Editor>();
     private codeMirrorVimObject: any = null;
     private manager: IMStatusManager;
     private editorMode: 'cm5' | 'cm6' = null;
     private initialized: boolean = false;
+    private eventRef: EventRef;
 
     async onload() {
         console.log('loading plugin VimIMSwitchPlugin.');
@@ -83,38 +81,39 @@ export default class VimIMSwitchPlugin extends Plugin {
         this.addSettingTab(new IMSwitchSettingTab(this.app, this));
 
         this.initialize();
+        console.log(this)
 
+        this.viewBind({});
         if (this.editorMode === 'cm5') {
             this.registerCodeMirror(cm => cm.on('vim-mode-change', this.onVimModeChange));
         } else {
-            this.app.workspace.on('file-open', _ => {
-                const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-                if (view) {
-                    const cmEditor = this.getCodeMirror(view);
-                    if (cmEditor) {
-                        this.editors.push(cmEditor);
-                        cmEditor.on('vim-mode-change', this.onVimModeChange);
-                    }
-                }
-            });
+            this.eventRef = this.app.workspace.on('file-open', this.viewBind);
+            this.registerEvent(this.eventRef);
+        }
+    }
+
+    viewBind = (_: any) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view) {
+            const cmEditor = this.getCodeMirror(view);
+            if (cmEditor) {
+                this.editors.add(cmEditor);
+                cmEditor.on('vim-mode-change', this.onVimModeChange);
+            }
         }
     }
 
     onVimModeChange = async (cm: any) => {
-        if (VimIMSwitchPlugin.once) {
-            VimIMSwitchPlugin.once = false;
-            if (cm.mode == "normal" || cm.mode == "visual") {
-                if (this.settings.enable) {
-                    this.normalizeOutput(await this.manager.insertToNormal());
-                }
-            } else if (cm.mode == "insert" || cm.mode == "replace") {
-                if (this.settings.enable) {
-                    this.normalizeOutput(await this.manager.normalToInsert());
-                }
+        // console.log("触发了")
+        if (cm.mode == "normal" || cm.mode == "visual") {
+            if (this.settings.enable) {
+                this.normalizeOutput(await this.manager.insertToNormal());
             }
-            VimIMSwitchPlugin.once = true;
+        } else if (cm.mode == "insert" || cm.mode == "replace") {
+            if (this.settings.enable) {
+                this.normalizeOutput(await this.manager.normalToInsert());
+            }
         }
-
     }
 
     normalizeOutput(execOut: ExecOut): void {
@@ -207,30 +206,30 @@ class IMSwitchSettingTab extends PluginSettingTab {
             .setName('Default IM')
             .setDesc('The default input method to switch to when entering normal mode.')
             .addText(text => text
-                .setValue(this.plugin.settings.default_im)
-                .setPlaceholder(DEFAULT_SETTINGS.default_im)
+                .setValue(this.plugin.settings.defaultIM)
+                .setPlaceholder(DEFAULT_SETTINGS.defaultIM)
                 .onChange(async value => {
-                    this.plugin.settings.default_im = value;
+                    this.plugin.settings.defaultIM = value;
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
             .setName('Obtain IM CMD')
             .setDesc('The full path to command to retrieve the current input method key.')
             .addText(text => text
-                .setValue(this.plugin.settings.obtain_im_cmd)
-                .setPlaceholder(DEFAULT_SETTINGS.obtain_im_cmd)
+                .setValue(this.plugin.settings.obtainIMCmd)
+                .setPlaceholder(DEFAULT_SETTINGS.obtainIMCmd)
                 .onChange(async value => {
-                    this.plugin.settings.obtain_im_cmd = value;
+                    this.plugin.settings.obtainIMCmd = value;
                     await this.plugin.saveSettings();
                 }));
         new Setting(containerEl)
             .setName('Switch IM CMD')
             .setDesc('The full path to command to switch input method, with {im} a placeholder for input method key.')
             .addText(text => text
-                .setValue(this.plugin.settings.switch_im_cmd)
-                .setPlaceholder(DEFAULT_SETTINGS.switch_im_cmd)
+                .setValue(this.plugin.settings.switchIMCmd)
+                .setPlaceholder(DEFAULT_SETTINGS.switchIMCmd)
                 .onChange(async value => {
-                    this.plugin.settings.switch_im_cmd = value;
+                    this.plugin.settings.switchIMCmd = value;
                     await this.plugin.saveSettings();
                 }));
     }
