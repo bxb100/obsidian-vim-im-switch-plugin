@@ -3,7 +3,7 @@
 	"name": "Vim Input Method Switch",
 	"version": "1.0.3",
 	"minAppVersion": "0.9.12",
-	"description": "Switch input method with fcitx-remote when Vim keymap is enabled.",
+	"description": "Switch input method with im-select when Vim keymap is enabled.",
 	"author": "Yuan Chen",
 	"authorUrl": "https://github.com/yuanotes",
 	"isDesktopOnly": true
