@@ -1,179 +1,236 @@
-import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, Workspace } from 'obsidian';
-import { exec } from "child_process";
-import { promisify } from "util";
+// noinspection TypeScriptUMDGlobal
+
+import {App, EventRef, MarkdownView, Plugin, PluginSettingTab, Setting} from 'obsidian';
+import {exec} from "child_process";
+import {promisify} from "util";
+
+declare const CodeMirror: any
 
 interface VimIMSwitchSettings {
-	fcitxRemotePath_macOS: string;
-	fcitxRemotePath_windows: string;
-	fcitxRemotePath_linux: string;
+    defaultIM: string;
+    enable: boolean;
+    obtainIMCmd: string;
+    switchIMCmd: string;
 }
 
 const DEFAULT_SETTINGS: VimIMSwitchSettings = {
-	fcitxRemotePath_macOS: '/usr/local/bin/fcitx-remote',
-	fcitxRemotePath_windows: 'C:\\Program Files\\bin\\fcitx-remote',
-	fcitxRemotePath_linux: '/usr/bin/fcitx-remote',
+    defaultIM: '',
+    enable: false,
+    obtainIMCmd: '/path/to/IMCmd',
+    switchIMCmd: '/path/to/IMCmd {im}',
 }
 
 const pexec = promisify(exec);
 
-enum IMStatus {
-	None,
-	Activate,
-	Deactivate,
+interface ExecOut {
+    stdout: string,
+    stderr: string
+}
+
+class IMStatusManager {
+    // insert to normal, set insertIm to current system IM, set system IM to defaultIm
+    // normal to insert, set system IM to insertIm
+    setting: VimIMSwitchSettings;
+    insertModeLastIM: string;
+
+    constructor(setting: VimIMSwitchSettings) {
+        this.setting = setting;
+        // check
+    }
+
+    switchIM(im: string): Promise<ExecOut> {
+        return pexec(this.setting.switchIMCmd.replace("{im}", im));
+    }
+
+    public normalToInsert(): Promise<ExecOut> {
+        if (this.insertModeLastIM) {
+            return this.switchIM(this.insertModeLastIM);
+        }
+        return new Promise<ExecOut>(resolve => resolve({stdout: '', stderr: ''}));
+    }
+
+    public insertToNormal(): Promise<ExecOut> {
+        return pexec(this.setting.obtainIMCmd).then(out => {
+            this.insertModeLastIM = out.stdout.trim();
+            if (this.setting.defaultIM) {
+                return this.switchIM(this.setting.defaultIM);
+            } else {
+                return new Promise<ExecOut>(resolve => {
+                    resolve({stdout: '', stderr: 'default IM is null'});
+                });
+            }
+        })
+    }
 }
 
 export default class VimIMSwitchPlugin extends Plugin {
-	settings: VimIMSwitchSettings;
-	imStatus = IMStatus.None;
-	fcitxRemotePath = "";
+    static once: boolean = true;
+    settings: VimIMSwitchSettings;
+    private editors: Set<CodeMirror.Editor> = new Set<CodeMirror.Editor>();
+    private codeMirrorVimObject: any = null;
+    private manager: IMStatusManager;
+    private editorMode: 'cm5' | 'cm6' = null;
+    private initialized: boolean = false;
+    private eventRef: EventRef;
 
-	async onload() {
-		console.log('loading plugin VimIMSwitchPlugin.');
+    async onload() {
+        console.log('loading plugin VimIMSwitchPlugin.');
 
-		await this.loadSettings();
+        await this.loadSettings();
 
-		// this.addStatusBarItem().setText('Vim IM Swith Enabled');
+        this.addSettingTab(new IMSwitchSettingTab(this.app, this));
 
-		this.addSettingTab(new IMSwitchSettingTab(this.app, this));
+        this.initialize();
+        console.log(this)
 
-		this.registerCodeMirror((cmEditor: CodeMirror.Editor) => {
-			// {mode: string, ?subMode: string} object. Modes: "insert", "normal", "replace", "visual". Visual sub-modes: "linewise", "blockwise"}
-			cmEditor.on("vim-mode-change", this.onVimModeChange);
-		});
-	}
+        this.viewBind({});
+        if (this.editorMode === 'cm5') {
+            this.registerCodeMirror(cm => cm.on('vim-mode-change', this.onVimModeChange));
+        } else {
+            this.eventRef = this.app.workspace.on('file-open', this.viewBind);
+            this.registerEvent(this.eventRef);
+        }
+    }
 
-	onVimModeChange = async (cm: any) => {
-		if (cm.mode == "normal" || cm.mode == "visual") {
-			await this.getFcitxRemoteStatus();
-			if (this.imStatus == IMStatus.Activate) {
-				await this.deactivateIM();
-			}
-		} else if (cm.mode == "insert" || cm.mode == "replace") {
-			if (this.imStatus == IMStatus.Activate) {
-				await this.activateIM();
-			}
-		}
-	}
+    viewBind = (_: any) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (view) {
+            const cmEditor = this.getCodeMirror(view);
+            if (cmEditor) {
+                this.editors.add(cmEditor);
+                cmEditor.on('vim-mode-change', this.onVimModeChange);
+            }
+        }
+    }
 
-	async runCmd(cmd: string, args: string[] = []) : Promise<string>{
-		const output = await pexec(`${cmd} ${args.join(" ")}`);
-		return output.stdout;
-	}
+    onVimModeChange = async (cm: any) => {
+        // console.log("触发了")
+        if (cm.mode == "normal" || cm.mode == "visual") {
+            if (this.settings.enable) {
+                this.normalizeOutput(await this.manager.insertToNormal());
+            }
+        } else if (cm.mode == "insert" || cm.mode == "replace") {
+            if (this.settings.enable) {
+                this.normalizeOutput(await this.manager.normalToInsert());
+            }
+        }
+    }
 
-	async getFcitxRemoteStatus() {
-		if (this.fcitxRemotePath == "") {
-			console.log("VIM-IM-Switch-pugin: cannot get fcitx-remote path, please set it correctly.");
-			return;
-		}
-		let fcitxRemoteOutput = await this.runCmd(this.fcitxRemotePath);
-		fcitxRemoteOutput = fcitxRemoteOutput.trimRight();
-		if (fcitxRemoteOutput == "1") {
-			this.imStatus = IMStatus.Deactivate;
-		} else if (fcitxRemoteOutput == "2") {
-			this.imStatus = IMStatus.Activate;
-		} else {
-			this.imStatus = IMStatus.None;
-		}
-		console.log("Vim-IM-Swith-plugin: IM status " + this.imStatus.toString());
-	}
-	async activateIM() {
-		if (this.fcitxRemotePath == "") {
-			console.log("VIM-IM-Switch-pugin: cannot get fcitx-remote path, please set it correctly.");
-			return;
-		}
-		const output = await this.runCmd(this.fcitxRemotePath, ["-o"]);
-		console.log("Vim-IM-Swith-plugin: activate IM " + output);
-	}
-	async deactivateIM() {
-		if (this.fcitxRemotePath == "") {
-			console.log("VIM-IM-Switch-pugin: cannot get fcitx-remote path, please set it correctly.");
-			return;
-		}
-		const output = await this.runCmd(this.fcitxRemotePath, ["-c"]);
-		console.log("Vim-IM-Swith-plugin: deactivate IM " + output);
-	}
+    normalizeOutput(execOut: ExecOut): void {
+        if (execOut.stdout) {
+            console.log(execOut.stdout);
+        }
+        if (execOut.stderr) {
+            console.error(execOut.stderr);
+        }
+    }
 
-	onunload() {
-		this.app.workspace.iterateCodeMirrors((cm: CodeMirror.Editor) => {
-			cm.off("vim-mode-change", this.onVimModeChange);
-		});
-		console.log('unloading plugin VimIMSwitchPlugin.');
-	}
+    onunload() {
+        if (this.editorMode === 'cm5') {
+            this.app.workspace.iterateCodeMirrors((cm: CodeMirror.Editor) => {
+                cm.off("vim-mode-change", this.onVimModeChange);
+            });
+        } else {
+            this.editors.forEach(cm => {
+                cm.off("vim-mode-change", this.onVimModeChange);
+            })
+        }
+        console.log('unloading plugin VimIMSwitchPlugin.');
+    }
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-		this.updateCurrentPath();
-	}
+    async loadSettings() {
+        this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    }
 
-	async updateCurrentPath() {
-		switch (process.platform) {
-			case 'darwin':
-				this.fcitxRemotePath = this.settings.fcitxRemotePath_macOS;
-				break;
-			case 'linux':
-				this.fcitxRemotePath = this.settings.fcitxRemotePath_linux;
-				break;
-			case 'win32':
-				this.fcitxRemotePath = this.settings.fcitxRemotePath_windows;
-				break;
-			default:
-				console.log('VIM-IM-Switch-plugin: does not support ' + process.platform + ' currently.');
-				break;
-		}
-	}
+    async saveSettings() {
+        await this.saveData(this.settings);
+    }
 
-	async saveSettings() {
-		await this.saveData(this.settings);
-	}
+    private initialize() {
+        if (this.initialized)
+            return;
+
+        this.manager = new IMStatusManager(this.settings);
+
+        // refer: Vimrc and https://publish.obsidian.md/hub/04+-+Guides%2C+Workflows%2C+%26+Courses/Guides/How+to+update+your+plugins+and+CSS+for+live+preview
+        // prefer using config to judge whether to use cm6 or cm5
+        if ((this.app.vault as any).config?.legacyEditor && (this.app.vault as any)?.config) {
+            this.codeMirrorVimObject = CodeMirror.Vim;
+            this.editorMode = 'cm5';
+            console.log('using CodeMirror 5 mode');
+        } else {
+            this.codeMirrorVimObject = (window as any).CodeMirrorAdapter?.Vim;
+            this.editorMode = 'cm6';
+            console.log('using CodeMirror 6 mode');
+        }
+
+        this.initialized = true;
+    }
+
+    private getCodeMirror(view: MarkdownView): CodeMirror.Editor {
+        // For CM6 this actually returns an instance of the object named CodeMirror from cm_adapter of codemirror_vim
+        if (this.editorMode == 'cm6') {
+            // noinspection JSDeprecatedSymbols
+            return (view as any).sourceMode?.cmEditor?.cm?.cm;
+        } else
+            // noinspection JSDeprecatedSymbols
+            return (view as any).sourceMode?.cmEditor;
+    }
 }
 
 class IMSwitchSettingTab extends PluginSettingTab {
-	plugin: VimIMSwitchPlugin;
+    plugin: VimIMSwitchPlugin;
 
-	constructor(app: App, plugin: VimIMSwitchPlugin) {
-		super(app, plugin);
-		this.plugin = plugin;
-	}
+    constructor(app: App, plugin: VimIMSwitchPlugin) {
+        super(app, plugin);
+        this.plugin = plugin;
+    }
 
-	display(): void {
-		let {containerEl} = this;
+    display(): void {
+        let {containerEl} = this;
 
-		containerEl.empty();
+        containerEl.empty();
 
-		containerEl.createEl('h2', {text: 'Settings for Vim IM Switch plugin.'});
+        containerEl.createEl('h2', {text: 'Settings for Vim IM Switch plugin.'});
 
-		new Setting(containerEl)
-			.setName('Fcitx Remote Path for macOS')
-			.setDesc('The absolute path to fcitx-remote bin file on macOS.')
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.fcitxRemotePath_macOS)
-				.setValue(this.plugin.settings.fcitxRemotePath_macOS)
-				.onChange(async (value) => {
-					this.plugin.settings.fcitxRemotePath_macOS = value;
-					this.plugin.updateCurrentPath();
-					await this.plugin.saveSettings();
-				}));
-		new Setting(containerEl)
-			.setName('Fcitx Remote Path for Linux')
-			.setDesc('The absolute path to fcitx-remote bin file on Linux.')
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.fcitxRemotePath_linux)
-				.setValue(this.plugin.settings.fcitxRemotePath_linux)
-				.onChange(async (value) => {
-					this.plugin.settings.fcitxRemotePath_linux = value;
-					this.plugin.updateCurrentPath();
-					await this.plugin.saveSettings();
-				}));
-		new Setting(containerEl)
-			.setName('Fcitx Remote Path for Windows')
-			.setDesc('The absolute path to fcitx-remote bin file on Windows.')
-			.addText(text => text
-				.setPlaceholder(DEFAULT_SETTINGS.fcitxRemotePath_windows)
-				.setValue(this.plugin.settings.fcitxRemotePath_windows)
-				.onChange(async (value) => {
-					this.plugin.settings.fcitxRemotePath_windows = value;
-					this.plugin.updateCurrentPath();
-					await this.plugin.saveSettings();
-				}));
-	}
+        new Setting(containerEl)
+            .setName('Enable')
+            .setDesc('Boolean denoting whether autoSwitchInputMethod is on/off.')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.enable)
+                .onChange(async value => {
+                    this.plugin.settings.enable = value;
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName('Default IM')
+            .setDesc('The default input method to switch to when entering normal mode.')
+            .addText(text => text
+                .setValue(this.plugin.settings.defaultIM)
+                .setPlaceholder(DEFAULT_SETTINGS.defaultIM)
+                .onChange(async value => {
+                    this.plugin.settings.defaultIM = value;
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName('Obtain IM CMD')
+            .setDesc('The full path to command to retrieve the current input method key.')
+            .addText(text => text
+                .setValue(this.plugin.settings.obtainIMCmd)
+                .setPlaceholder(DEFAULT_SETTINGS.obtainIMCmd)
+                .onChange(async value => {
+                    this.plugin.settings.obtainIMCmd = value;
+                    await this.plugin.saveSettings();
+                }));
+        new Setting(containerEl)
+            .setName('Switch IM CMD')
+            .setDesc('The full path to command to switch input method, with {im} a placeholder for input method key.')
+            .addText(text => text
+                .setValue(this.plugin.settings.switchIMCmd)
+                .setPlaceholder(DEFAULT_SETTINGS.switchIMCmd)
+                .onChange(async value => {
+                    this.plugin.settings.switchIMCmd = value;
+                    await this.plugin.saveSettings();
+                }));
+    }
 }
